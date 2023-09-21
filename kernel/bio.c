@@ -23,33 +23,91 @@
 #include "fs.h"
 #include "buf.h"
 
+#define BUCKETSIZE 13 
+
 struct {
-  struct spinlock lock;
+  struct spinlock lock[BUCKETSIZE];
+  struct spinlock find;
   struct buf buf[NBUF];
 
   // Linked list of all buffers, through prev/next.
   // Sorted by how recently the buffer was used.
   // head.next is most recent, head.prev is least.
-  struct buf head;
+  // 单向链表
+  struct buf head[BUCKETSIZE];
 } bcache;
+
+struct buf evict;
 
 void
 binit(void)
 {
+  // printf(" init BEGIN\n ");
   struct buf *b;
 
-  initlock(&bcache.lock, "bcache");
+  initlock(&bcache.find, "find");
+
+  for(int i=0; i<BUCKETSIZE; i++){
+    initlock(&bcache.lock[i], "bcache");
+    bcache.head[i].next = 0;
+  }
 
   // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
+  // 环形
   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
     initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    b->refcnt = 0;
+    b->tick = 0;
+    b->next = evict.next;
+    evict.next = b;
   }
+  // printf(" init end\n ");
+}
+
+// 获取最久未使用的buf
+// 记得释放锁
+int 
+get_oldbuf (struct buf ** res) {
+  // printf(" get_oldbuf here begin\n ");
+  uint old = 4294967295U;
+  int j=-1;
+  int flag = 0;
+  int sum=0;
+  for(int i=0 ; i<BUCKETSIZE; i++) {
+    acquire(&bcache.lock[i]);
+    // printf(" get_oldbuf here %d\n ", i);
+    flag = 0;
+    
+    struct buf * pre = &bcache.head[i];
+    struct buf * stash;
+    for(struct buf * b = bcache.head[i].next; b; b = b->next) {
+      sum++;
+      // printf(" get_oldbuf here buf %d\n ", flag);
+      // 一旦选中就转移到head位置,pre位置继续往后遍历
+      if(b->refcnt == 0 && b->tick < old) {
+        stash = pre;
+        flag = 1;
+        // printf(" get_oldbuf here renew %d %p\n",i,b);
+        pre->next = b->next;
+        b->next = bcache.head[i].next;
+        bcache.head[i].next = b;
+
+        *res = b;
+        old = b->tick;
+        b = stash;
+      }
+      pre = b;
+    }
+    // 如果没拿到，锁就直接释放
+    if(!flag) release(&bcache.lock[i]);
+    else {
+      if(j != -1)release(&bcache.lock[j]);
+      j = i;
+    }
+  }
+  printf(" get_oldbuf here end %d\n ",sum);
+
+  return j;
 }
 
 // Look through buffer cache for block on device dev.
@@ -58,33 +116,66 @@ binit(void)
 static struct buf*
 bget(uint dev, uint blockno)
 {
+  // printf(" bget begin\n ");
   struct buf *b;
 
-  acquire(&bcache.lock);
+  uint hash = blockno % BUCKETSIZE;
+  acquire(&bcache.lock[hash]);
 
   // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
+  printf(" bget here %d\n ",hash);
+  for(b = bcache.head[hash].next; b; b = b->next){
+    // printf(" bget loop\n ");
     if(b->dev == dev && b->blockno == blockno){
+      // printf(" bget 001\n ");
       b->refcnt++;
-      release(&bcache.lock);
+      // printf(" bget 001\n ");
+      b->tick = ticks;
+      // printf(" bget 001\n ");
+      release(&bcache.lock[hash]);
+      // printf(" bget 001\n ");
       acquiresleep(&b->lock);
+      // printf(" bget 001\n ");
       return b;
     }
   }
 
   // Not cached.
   // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
+  printf(" bget here\n ");
+  release(&bcache.lock[hash]);
+  int id = get_oldbuf(&b);
+
+  printf(" bget id %d %p\n ",id, b);
+  if(id != -1) {
+    // // printf(" bget 001\n ");
+    if (id != hash) acquire(&bcache.lock[hash]);
+    struct buf *bf = b;
+    if (id != hash) {
+      bcache.head[id].next = b->next;
+      release(&bcache.lock[id]);
+    } 
+
+    // // printf(" bget 002\n ");
+    bf->dev = dev;
+    bf->blockno = blockno;
+    bf->valid = 0;
+    bf->refcnt = 1;
+
+    // // printf(" bget 003\n ");
+    // 转移到新的桶头
+    if (id != hash) {
+      bf->next = bcache.head[0].next;
+      bcache.head[0].next = bf;
     }
+    initsleeplock(&bf->lock, "buffer");
+    
+    release(&bcache.lock[hash]);
+    acquiresleep(&b->lock);
+    // printf(" bget 004\n ");
+    return b;
   }
+
   panic("bget: no buffers");
 }
 
@@ -121,33 +212,33 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  int hash = b->blockno % BUCKETSIZE;
+  acquire(&bcache.lock[hash]);
   b->refcnt--;
   if (b->refcnt == 0) {
     // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    b->tick = ticks;
   }
   
-  release(&bcache.lock);
+  release(&bcache.lock[hash]);
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int hash = b->blockno % BUCKETSIZE;
+
+  acquire(&bcache.lock[hash]);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bcache.lock[hash]);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int hash = b->blockno % BUCKETSIZE;
+
+  acquire(&bcache.lock[hash]);
   b->refcnt--;
-  release(&bcache.lock);
+  release(&bcache.lock[hash]);
 }
 
 
