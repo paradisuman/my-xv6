@@ -377,9 +377,11 @@ iunlockput(struct inode *ip)
 static uint
 bmap(struct inode *ip, uint bn)
 {
-  uint addr, *a;
+  uint addr, *a, *d_addr;
   struct buf *bp;
+  struct buf *dbp;
 
+  // 前十一个块
   if(bn < NDIRECT){
     if((addr = ip->addrs[bn]) == 0)
       ip->addrs[bn] = addr = balloc(ip->dev);
@@ -387,6 +389,7 @@ bmap(struct inode *ip, uint bn)
   }
   bn -= NDIRECT;
 
+  // 前11+256个块
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
     if((addr = ip->addrs[NDIRECT]) == 0)
@@ -400,6 +403,35 @@ bmap(struct inode *ip, uint bn)
     brelse(bp);
     return addr;
   }
+  bn -= NINDIRECT;
+  // 双重间接块
+  if(bn < DDIRECT){
+    // Load indirect block, allocating if necessary.
+    if((addr = ip->addrs[NDIRECT+1]) == 0)
+      ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
+    
+    // 获取间接块
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+
+    if((addr = a[bn/BLOCKNUM]) == 0){
+      a[bn/BLOCKNUM] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+
+    // 获取块
+    dbp = bread(ip->dev, addr);
+    d_addr = (uint*)dbp->data;
+
+    if((addr = d_addr[bn%BLOCKNUM]) == 0){
+      d_addr[bn%BLOCKNUM] = addr = balloc(ip->dev);
+      log_write(dbp);
+    }
+
+    brelse(dbp);
+    return addr;
+  }
 
   panic("bmap: out of range");
 }
@@ -409,9 +441,9 @@ bmap(struct inode *ip, uint bn)
 void
 itrunc(struct inode *ip)
 {
-  int i, j;
-  struct buf *bp;
-  uint *a;
+  int i, j, k;
+  struct buf *bp, *dbp;
+  uint *a, *d_addr;
 
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
@@ -426,6 +458,31 @@ itrunc(struct inode *ip)
     for(j = 0; j < NINDIRECT; j++){
       if(a[j])
         bfree(ip->dev, a[j]);
+    }
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT]);
+    ip->addrs[NDIRECT] = 0;
+  }
+
+  // 删除间接块
+  if(ip->addrs[NDIRECT+1]){
+    // 获取第一层
+    bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
+    a = (uint*)bp->data;
+    for(j = 0; j < NINDIRECT; j++){
+      if(a[j]) {
+        // 获取第二层
+        dbp = bread(ip->dev, ip->addrs[a[j]]);
+        d_addr = (uint*)dbp->data;
+
+        for(k = 0; k < NINDIRECT; k++){
+          if(d_addr[k])
+            bfree(ip->dev, d_addr[k]);
+        }
+        brelse(dbp);
+        bfree(ip->dev, d_addr[k]);
+        d_addr[k] = 0;
+      }
     }
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
